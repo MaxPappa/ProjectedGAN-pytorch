@@ -3,8 +3,7 @@ from torchvision import transforms, datasets
 
 
 def load_data(data_path, batch_size):
-    train_transforms = transforms.Compose([transforms.RandomRotation(30),
-                                           transforms.Resize((256, 256)),
+    train_transforms = transforms.Compose([transforms.Resize((256, 256)),
                                            transforms.RandomHorizontalFlip(),
                                            transforms.ToTensor(),
                                            transforms.Normalize([0.485, 0.456, 0.406],
