@@ -1,7 +1,5 @@
-from pickletools import optimize
-from pyexpat import features
 import pytorch_lightning as pl
-from typing import Any, Tuple
+from typing import Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +9,10 @@ from utils import kaiming_init, load_checkpoint
 from efficient_net import build_efficientnet_lite
 from generator import Generator
 from differentiable_augmentation import DiffAugment
-from dataset import load_data
+from dataclasses import asdict
+import wandb
+import torchvision.utils as vutils
+
 
 class DownBlock(nn.Module):
     def __init__(self, c_in, c_out):
@@ -59,35 +60,27 @@ class CSM(nn.Module):
 
     def forward(self, high_res, low_res=None):
         batch, channels, width, height = high_res.size()
-        if low_res is None:
-            # high_res_flatten = rearrange(high_res, "b c h w -> b c (h w)")
-            high_res_flatten = high_res.view(batch, channels, width * height)
-            high_res = self.conv1(high_res_flatten)
-            high_res = high_res.view(batch, channels, width, height)
-            high_res = self.conv3(high_res)
-            high_res = F.interpolate(high_res, scale_factor=2., mode="bilinear")
-            return high_res
-        else:
-            high_res_flatten = high_res.view(batch, channels, width * height)
-            high_res = self.conv1(high_res_flatten)
-            high_res = high_res.view(batch, channels, width, height)
+        high_res_flatten = high_res.view(batch, channels, width * height)
+        high_res = self.conv1(high_res_flatten)
+        high_res = high_res.view(batch, channels, width, height)
+        if not(low_res is None):
             high_res = torch.add(high_res, low_res)
-            high_res = self.conv3(high_res)
-            high_res = F.interpolate(high_res, scale_factor=2., mode="bilinear")
-            return high_res
-
+        high_res = self.conv3(high_res)
+        high_res = F.interpolate(high_res, scale_factor=2., mode="bilinear")
+        return high_res
 
 class litProjectedGAN(pl.LightningModule):
     def __init__(self, *args):
         super(litProjectedGAN, self).__init__()
-        self.img_size = 100#args.image_size
+        self.save_hyperparameters(asdict(args) if not isinstance(args, Dict) else args)
+        self.img_size = args.image_size
 
-        self.gen = Generator()#args.image_size)
+        self.gen = Generator(args.image_size)
 
         self.efficient_net = build_efficientnet_lite("efficientnet_lite1", 1000)
         self.efficient_net = nn.DataParallel(self.efficient_net)
-        # checkpoint = torch.load("./efficientnet_lite0.pth")
-        # load_checkpoint(self.efficient_net, checkpoint)
+        checkpoint = torch.load(args.checkpoint_efficient_net)
+        load_checkpoint(self.efficient_net, checkpoint)
         self.efficient_net.eval()
 
         feature_sizes = self.get_feature_channels()
@@ -105,19 +98,11 @@ class litProjectedGAN(pl.LightningModule):
            MultiScaleDiscriminator(feature_sizes[3], 4),
         ][::-1])
 
-        self.latent_dim =100# args.latent_dim
-        self.epochs = 2#args.epochs
+        self.latent_dim = args.latent_dim
 
         augmentations = 'color,translation,cutout'
         self.DiffAug = DiffAugment(augmentations)
-        self.diff_aug = 'abc'#args.diff_aug
-
-        # self.dataset = load_data(args.dataset_path, args.batch_size)
-        self.log_every = 1#args.log_every
-        # self.ckpt_path = args.checkpoint_path
-        # self.save_all = args.save_all
-        self.automatic_optimization = False
-
+        self.diff_aug = args.diff_aug
     
     def get_feature_channels(self):
         sample = torch.randn(1, 3, self.img_size, self.img_size)
@@ -168,7 +153,7 @@ class litProjectedGAN(pl.LightningModule):
             _, feature_real = self.efficient_net(real_imgs)
             feature_real = self.csm_forward_idx(feature_real, optimizer_idx-1)
             features_fake = self.csm_forward_idx(feature_fake, optimizer_idx-1)
-            disc_losses = []
+            # disc_losses = []
             # for feature_real, feature_fake, disc in zip(features_real, features_fake, self.discs):
             y_hat_real = self.discs[optimizer_idx-1](feature_real)  # Cx4x4
             y_hat_fake = self.discs[optimizer_idx-1](feature_fake)  # Cx4x4
@@ -180,7 +165,7 @@ class litProjectedGAN(pl.LightningModule):
             self.log(f"disc_lossFake_{optimizer_idx-1}", loss_fake)
             disc_loss = loss_real + loss_fake
             self.log(f"disc_loss_{optimizer_idx}", disc_loss)
-            return {"loss": disc_losses}
+            return {"loss": disc_loss}
 
         # Train Generator:
         if optimizer_idx == 0:
@@ -204,9 +189,23 @@ class litProjectedGAN(pl.LightningModule):
             self.log("gen_loss", gen_loss)
             return {"loss":gen_loss}
 
-    def validation_step(self, *args, **kwargs):
-        return super().validation_step(*args, **kwargs)
-    
+    def on_epoch_end(self):
+        with torch.no_grad():
+            z = self.validation_z.type_as(self.gen.model[0].weight)
+            sample_imgs = self.gen(z)
+            grid = vutils.make_grid(sample_imgs, nrow=5, padding=2, normalize=True)
+            images_staticZ = wandb.Image(grid, caption="Generated Images (Static Z)")
+
+            z = torch.randn(25, self.latent_dim).to(self.device)
+            sample_imgs = self.gen(z)
+            grid = vutils.make_grid(sample_imgs, nrow=5, padding=2, normalize=True)
+            images_randomZ = wandb.Image(grid, caption="Generated Images (Random Z)")
+            wandb.log({"Genearated images from Static Z and Varying Z": (images_staticZ,images_randomZ)})
+
+
+    def on_fit_start(self):
+        self.validation_static_z = torch.randn(25, self.latent_dim, device=self.device)
+
     def configure_optimizers(self):
         optimizers_list = [Adam(self.gen.parameters(), lr=self.args.lr, betas=(self.args.beta1,self.args.beta2))]
         optimizers_list += [Adam(disc.parameters(),lr=0.0002, betas=(0,0.99)) for disc in self.discs]
