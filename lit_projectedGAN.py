@@ -12,6 +12,7 @@ from differentiable_augmentation import DiffAugment
 from dataclasses import asdict
 import wandb
 import torchvision.utils as vutils
+import pdb
 
 
 class DownBlock(nn.Module):
@@ -27,7 +28,7 @@ class DownBlock(nn.Module):
         return self.leaky_relu(x)
 
 
-class MultiScaleDiscriminator(nn.Module):
+class MultiScaleDiscriminator(nn.Module):# sistemare questo!!!!!
     def __init__(self, channels, l):
         super(MultiScaleDiscriminator, self).__init__()
         self.head_conv = spectral_norm(nn.Conv2d(512, 1, 3, 1, 1))
@@ -60,22 +61,23 @@ class CSM(nn.Module):
 
     def forward(self, high_res, low_res=None):
         batch, channels, width, height = high_res.size()
+        # pdb.set_trace()
         high_res_flatten = high_res.view(batch, channels, width * height)
         high_res = self.conv1(high_res_flatten)
         high_res = high_res.view(batch, channels, width, height)
         if not(low_res is None):
             high_res = torch.add(high_res, low_res)
         high_res = self.conv3(high_res)
-        high_res = F.interpolate(high_res, scale_factor=2., mode="bilinear")
+        high_res = F.interpolate(high_res, scale_factor=2., mode="bilinear", align_corners=True)
         return high_res
 
 class litProjectedGAN(pl.LightningModule):
-    def __init__(self, *args):
+    def __init__(self, args):
         super(litProjectedGAN, self).__init__()
         self.save_hyperparameters(asdict(args) if not isinstance(args, Dict) else args)
         self.img_size = args.image_size
 
-        self.gen = Generator(args.image_size)
+        self.gen = Generator(im_size=args.image_size)
 
         self.efficient_net = build_efficientnet_lite("efficientnet_lite1", 1000)
         self.efficient_net = nn.DataParallel(self.efficient_net)
@@ -90,12 +92,11 @@ class litProjectedGAN(pl.LightningModule):
             CSM(feature_sizes[1], feature_sizes[0]),
             CSM(feature_sizes[0], feature_sizes[0]),
         ])
-
         self.discs = nn.ModuleList([
            MultiScaleDiscriminator(feature_sizes[0], 1),
+           MultiScaleDiscriminator(feature_sizes[0], 2),
            MultiScaleDiscriminator(feature_sizes[1], 2),
            MultiScaleDiscriminator(feature_sizes[2], 3),
-           MultiScaleDiscriminator(feature_sizes[3], 4),
         ][::-1])
 
         self.latent_dim = args.latent_dim
@@ -114,11 +115,11 @@ class litProjectedGAN(pl.LightningModule):
         csm_features = []
         for i, csm in enumerate(self.csms):
             if i == 0:
-                d = csm(features[i])
-                csm_features.append(d)
+                dd = csm(features[i])
+                csm_features.append(dd)
             else:
-                d = csm(features[i], d)
-                csm_features.append(d)
+                dd = csm(features[i], dd)
+                csm_features.append(dd)
         return csm_features #features
 
     def csm_forward_idx(self, features, idx):
@@ -142,21 +143,22 @@ class litProjectedGAN(pl.LightningModule):
         return self.gen(x)
 
     def training_step(self, batch: Tuple[torch.tensor, torch.tensor], batch_idx, optimizer_idx):
+        batch = batch[0]
         z = torch.randn(batch.shape[0], self.latent_dim, device=self.device)
         gen_imgs_disc = self.gen(z).detach()
         if self.diff_aug:
-            gen_imgs_disc = self.DiffAug(gen_imgs_disc)
-            real_imgs = self.DiffAug(batch)
+            gen_imgs_disc = self.DiffAug.forward(gen_imgs_disc)
+            real_imgs = self.DiffAug.forward(batch)
         
-        if optimizer_idx != 0:
+        if optimizer_idx != 0: # optimizer_idx will be 0 for generator and >= 1 for discs optimizers
             _, feature_fake = self.efficient_net(gen_imgs_disc)
             _, feature_real = self.efficient_net(real_imgs)
             feature_real = self.csm_forward_idx(feature_real, optimizer_idx-1)
-            features_fake = self.csm_forward_idx(feature_fake, optimizer_idx-1)
+            feature_fake = self.csm_forward_idx(feature_fake, optimizer_idx-1)
             # disc_losses = []
             # for feature_real, feature_fake, disc in zip(features_real, features_fake, self.discs):
-            y_hat_real = self.discs[optimizer_idx-1](feature_real)  # Cx4x4
-            y_hat_fake = self.discs[optimizer_idx-1](feature_fake)  # Cx4x4
+            y_hat_real = self.discs[optimizer_idx-1](feature_real[optimizer_idx-1])  # Cx4x4
+            y_hat_fake = self.discs[optimizer_idx-1](feature_fake[optimizer_idx-1])  # Cx4x4
             y_hat_real = y_hat_real.sum(1)  # sum along channels axis (is 1 anyways, however it still removes the unnecessary axis)
             y_hat_fake = y_hat_fake.sum(1)
             loss_real = torch.mean(F.relu(1. - y_hat_real))
@@ -164,7 +166,7 @@ class litProjectedGAN(pl.LightningModule):
             loss_fake = torch.mean(F.relu(1. + y_hat_fake))
             self.log(f"disc_lossFake_{optimizer_idx-1}", loss_fake)
             disc_loss = loss_real + loss_fake
-            self.log(f"disc_loss_{optimizer_idx}", disc_loss)
+            self.log(f"disc_loss_{optimizer_idx-1}", disc_loss)
             return {"loss": disc_loss}
 
         # Train Generator:
@@ -177,12 +179,13 @@ class litProjectedGAN(pl.LightningModule):
 
             # get efficient net features
             _, features_fake = self.efficient_net(gen_imgs_gen)
-
+            # pdb.set_trace()
             # feed efficient net features through CSM
             features_fake = self.csm_forward(features_fake)
 
             gen_loss = 0.
             for feature_fake, disc in zip(features_fake, self.discs):
+                # pdb.set_trace()
                 y_hat = disc(feature_fake)
                 y_hat = y_hat.sum(1)
                 gen_loss = -torch.mean(y_hat)
@@ -190,23 +193,29 @@ class litProjectedGAN(pl.LightningModule):
             return {"loss":gen_loss}
 
     def on_epoch_end(self):
-        with torch.no_grad():
-            z = self.validation_z.type_as(self.gen.model[0].weight)
-            sample_imgs = self.gen(z)
-            grid = vutils.make_grid(sample_imgs, nrow=5, padding=2, normalize=True)
-            images_staticZ = wandb.Image(grid, caption="Generated Images (Static Z)")
+        if (self.current_epoch % self.hparams.log_every) == 0:
+            with torch.no_grad():
+                mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device)
+                std = torch.tensor([0.229, 0.224, 0.225]).to(self.device)
 
-            z = torch.randn(25, self.latent_dim).to(self.device)
-            sample_imgs = self.gen(z)
-            grid = vutils.make_grid(sample_imgs, nrow=5, padding=2, normalize=True)
-            images_randomZ = wandb.Image(grid, caption="Generated Images (Random Z)")
-            wandb.log({"Genearated images from Static Z and Varying Z": (images_staticZ,images_randomZ)})
+                z = self.validation_static_z.type_as(self.gen.model[0].weight)
+                sample_imgs = self.gen(z)
+                sample_imgs = sample_imgs * std[...,None,None] + mean[...,None,None]
+                grid = vutils.make_grid(sample_imgs, nrow=5, padding=2)
+                images_staticZ = wandb.Image(grid, caption="Generated Images (Static Z)")
+
+                z = torch.randn(25, self.latent_dim).to(self.device)
+                sample_imgs = self.gen(z)
+                sample_imgs = sample_imgs * std[...,None,None] + mean[...,None,None]
+                grid = vutils.make_grid(sample_imgs, nrow=5, padding=2)
+                images_randomZ = wandb.Image(grid, caption="Generated Images (Random Z)")
+                wandb.log({"Genearated images from Static Z and Varying Z": (images_staticZ,images_randomZ)})
 
 
     def on_fit_start(self):
         self.validation_static_z = torch.randn(25, self.latent_dim, device=self.device)
 
     def configure_optimizers(self):
-        optimizers_list = [Adam(self.gen.parameters(), lr=self.args.lr, betas=(self.args.beta1,self.args.beta2))]
+        optimizers_list = [Adam(self.gen.parameters(), lr=self.hparams.lr, betas=(self.hparams.beta1,self.hparams.beta2))]
         optimizers_list += [Adam(disc.parameters(),lr=0.0002, betas=(0,0.99)) for disc in self.discs]
-        return [optimizers_list], [] # empty lr-scheduler list. Dunno what to use.
+        return optimizers_list, [] # empty lr-scheduler list. Dunno what to use.
