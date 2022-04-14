@@ -77,7 +77,7 @@ class litProjectedGAN(pl.LightningModule):
         self.save_hyperparameters(asdict(args) if not isinstance(args, Dict) else args)
         self.img_size = args.image_size
 
-        self.gen = Generator(im_size=args.image_size)
+        self.gen = Generator(im_size=args.image_size, nz=args.latent_dim)
 
         self.efficient_net = build_efficientnet_lite("efficientnet_lite1", 1000)
         self.efficient_net = nn.DataParallel(self.efficient_net)
@@ -198,7 +198,7 @@ class litProjectedGAN(pl.LightningModule):
                 mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device)
                 std = torch.tensor([0.229, 0.224, 0.225]).to(self.device)
 
-                z = self.validation_static_z.type_as(self.gen.model[0].weight)
+                z = self.validation_static_z.type_as(self.gen.init.init[0].weight)
                 sample_imgs = self.gen(z)
                 sample_imgs = sample_imgs * std[...,None,None] + mean[...,None,None]
                 grid = vutils.make_grid(sample_imgs, nrow=5, padding=2)

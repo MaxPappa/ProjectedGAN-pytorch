@@ -13,6 +13,7 @@ class EpochModelCheckpoint(pl.Callback):
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if (trainer.current_epoch % self.num_epoch) == 0:
             trainer.save_checkpoint(f"./checkpoints/epoch={trainer.current_epoch}_LitProjectedGANArt.pth")
+            wandb.save(f"./checkpoints/epoch={trainer.current_epoch}_LitProjectedGANArt.pth")
 
 
 
