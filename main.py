@@ -4,12 +4,12 @@ from lit_projectedGAN import litProjectedGAN
 from dataset import load_data
 import config
 from os import mkdir
+import wandb
 
 class EpochModelCheckpoint(pl.Callback):
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         if (trainer.current_epoch % 10) == 0:
             trainer.save_checkpoint(f"./checkpoints/epoch={trainer.current_epoch}_LitProjectedGANArt.pth")
-
 
 
 
@@ -26,3 +26,5 @@ if __name__ == '__main__':
         callbacks=[EpochModelCheckpoint()]
     )
     trainer.fit(model, data)
+    wandb.save(f"./checkpoints/*")
+    wandb.finish()
