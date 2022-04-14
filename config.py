@@ -14,3 +14,4 @@ class configParams:
     log_every: int = 10
     dataset_path: str = "./data2"
     image_size: int = 256
+    num_epoch_checkpoint: int = 10
